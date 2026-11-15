@@ -11,7 +11,7 @@ function cityPanel(c){
     ${C.ru?`<p class="why">${tr('city_panel.includes_the_mandatory_government',{cost:fmt$(RU_BOX),mo:fmt$(RU_BOX_MO)})}</p>`:''}${(q=>btn(tr('city_panel.build_pop_cost_mo_mo',{cost:fmt$(popCost(c)+(q?q.cost:0)),mo:fmt$(popMo(c)+(q?q.mo:0))}),'buildPop',{city:c},'pink big',S.cash<popCost(c))+(q?`<p class="note">${tr('pop_std.includes_the_standard_n_model',{n:q.rt,model:esc(RG[q.g].n),cost:fmt$(q.cost),mo:fmt$(q.mo)})}</p>`:''))(popStdQuote())}
     <p class="note">${tr('city_panel.or_drag_from_one_of_your')}</p></section>${opsTplHtml(c)}`}`;
     h+=offersHere(c);
-    const trs=NETS.filter(n=>sellsAt(n,c));
+    const trs=NETS.filter(n=>gameNetAllowed(n)&&sellsAt(n,c));
     const fh=FABS.filter(f=>f.cities.includes(c));
     if(ix&&fh.length){if(remoteCities().includes(c))h+=ixSection(c).replace('<h3>'+tr('common.internet_exchange')+'</h3>','<h3>'+tr('city_panel.remote_peering_at_the_ix')+'</h3>');
       else h+=`<section><h3>${tr('common.remote_peering')}</h3><p class="lead">${tr('city_panel.peer_at_ix_without_building_a',{ix:esc(ix),fabs:fh.map(f=>esc(f.name)).join(tr('common.or'))})}</p>${REMOTE_WARN}${btn(tr('city_panel.order_circuit_anyway'),'openVxc',{to:c},'ghost sm')}</section>`;}
@@ -30,7 +30,7 @@ function cityPanel(c){
     else{const eye=R.cityEye[c]||0;
       h+=`<div class="kv"><span>${tr('common.eyeball_demand')}</span><b>${tr('city_panel.a_of_b',{a:fmtG(eye),b:fmtG(eyeP(c))})}</b></div><div class="bar me"><i style="width:${Math.min(100,eye/eyeP(c)*100)}%"></i></div>
       <div class="kv"><span>${tr('city_panel.served_in_city',{city:C.name})}</span><b style="color:${sf<0.9?'var(--bad)':'var(--eye)'}">${pct(sf)}</b></div><div class="bar ${sf<0.9?'bad':''}"><i style="width:${sf*100}%"></i></div>
-      <div class="kv"><span>${tr('common.revenue')}</span><b>${tr('common.price_mo',{price:fmt$(eye*sf*EYE_RATE*arpuOf(c))})}</b></div>
+      <div class="kv"><span>${tr('common.revenue')}</span><b>${tr('common.price_mo',{price:fmt$(broadbandRevenue(eye,sf,c,R.reach))})}</b></div>
       <div class="kv"><span>${tr('city_panel.network_wide_peering_ratio')}</span><b>${pct(R.peerShare||0)}</b></div><p class="note">${tr('city_panel.more_traffic_over_peering_pnis_and')}</p>
       ${sf<0.9?`<p class="why">${tr('city_panel.customers_are_unhappy_and_leaving')}</p>`:''}
       <div class="btns">${p.boost>S.day?`<span class="tag st on">${tr('city_panel.ad_campaign_n_d_left',{n:p.boost-S.day})}</span>`:btn(tr('city_panel.run_ad_campaign_8k_2_growth'),'ad',{city:c},'',S.cash<8000)}</div>`;}
@@ -42,8 +42,8 @@ function cityPanel(c){
   }else if(UI.tab==='up'){
     h+=netFilterHtml()+portNote(c)+latNote(c);
     h+=`<section><h3>${tr('common.ip_transit')}</h3><p class="lead">${tr('city_panel.pay_a_bigger_network_per_gbps')}</p>`;
-    const prov0=NETS.filter(n=>sellsAt(n,c)).sort((a,b)=>a.price-b.price),prov=prov0.filter(n=>netKeep(n,S.transit.some(x=>x.city===c&&x.net===n.id)));
-    if(!prov0.length)h+=`<p class="empty">${tr('city_panel.nobody_sells_transit_here_haul_your')}</p>`;else if(!prov.length)h+=netNone();
+    const prov0=modeOn('pioneer')?[]:NETS.filter(n=>sellsAt(n,c)).sort((a,b)=>a.price-b.price),prov=prov0.filter(n=>netKeep(n,S.transit.some(x=>x.city===c&&x.net===n.id)));
+    if(modeOn('pioneer'))h+=`<p class="empty">${tr('title.pioneer_no_tier_1_desc')}</p>`;else if(!prov0.length)h+=`<p class="empty">${tr('city_panel.nobody_sells_transit_here_haul_your')}</p>`;else if(!prov.length)h+=netNone();
     for(const n of prov){const t=S.transit.find(x=>x.city===c&&x.net===n.id);const pr=transitPerG(n,c,premOnlyAt(n,c)||!!(t&&premOn(t)))*S.priceMul;
       h+=`<div class="row">${logo(n)}<div class="grow"><div class="nm">${esc(n.name)} <span class="tag ${n.type}">${TYPE_L[n.type]}</span></div><div class="meta">${tr('city_panel.price_per_gbps_month_billed_on',{price:pr.toFixed(2)})}</div>${premOnlyAt(n,c)&&!t?`<div class="meta">${tr('city_panel.only_the_cn_too_premium_crossing')}</div>`:''}`;
       if(t){const u=R.useT[t.id]||0,cap=lagCap(PORT[t.tier].g,t.n),tdown=t.down>S.day;

@@ -16,7 +16,7 @@ function pniRow(c,n,pn,v,chk){let h=`<div class="row prow">${logo(n)}<div class=
   return h+`</div></div>`;}
 function pniListHtml(c){const f=UI.pniF||'all',az=UI.pniSort==='az',open=UI.pniOpen||{};
   // The search (#199) first: a network it hides needs no value worked out.
-  const rows=NETS.filter(n=>n.pops.includes(c)).map(n=>[n,S.pni.find(x=>x.city===c&&x.net===n.id)||null]).filter(([n,pn])=>netKeep(n,pn)).map(([n,pn])=>{const chk=pn?null:peerOk(n.id,'pni',c),v=pn?null:pniVal(n.id,c);return {n,pn,v,chk,s:pniStat(n.id,c).k,go:!!pn||(chk.ok&&v.g>=1)};});
+  const rows=NETS.filter(n=>gameNetAllowed(n)&&n.pops.includes(c)).map(n=>[n,S.pni.find(x=>x.city===c&&x.net===n.id)||null]).filter(([n,pn])=>netKeep(n,pn)).map(([n,pn])=>{const chk=pn?null:peerOk(n.id,'pni',c),v=pn?null:pniVal(n.id,c);return {n,pn,v,chk,s:pniStat(n.id,c).k,go:!!pn||(chk.ok&&v.g>=1)};});
   const keep=r=>f==='all'||(f==='t'&&(r.s==='t'||r.s==='none'))||(f==='worth'&&r.v&&r.v.worth)||(f==='pni'&&(r.s==='here'||r.s==='else'));
   const val=r=>r.v?r.v.val:-Infinity;
   rows.sort((a,b)=>az?a.n.name.localeCompare(b.n.name):(b.v&&b.v.worth)-(a.v&&a.v.worth)||val(b)-val(a)||a.n.name.localeCompare(b.n.name));

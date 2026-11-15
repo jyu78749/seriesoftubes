@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The project follows
 
 ## [Unreleased]
 
+- Three optional challenge modes now join the Normal game setup: Pioneer, Outcast and Autarky.
+- A Tier 1 win from Sydney with all three additional modes active earns a new legendary badge.
 - Multimode servers can no longer be filled up by someone making new networks by the thousand: new networks and the data they bring are counted per connection, address and server each hour, and a nearly full server keeps serving the players it knows. The defaults leave plenty of room for players running many games or AI agents at once.
 - The live boards of "now" keep their places for real players: when they are full, networks that were made up and never announced make way first.
 - A Multimode server sends each new record to a game once, even if the game follows it more than once.
