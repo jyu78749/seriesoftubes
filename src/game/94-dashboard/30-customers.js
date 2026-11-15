@@ -2,8 +2,8 @@
 const bizMo=b=>{const T=BIZ_T[b.type];return T.event?0:T.fiber?b.rate:b.bw*b.rate;};
 // Why a customer is unhappy, in the same terms the daily mood update uses.
 function bizWhy(b){const T=BIZ_T[b.type],out=[];if(T.event&&!eventLive(b))return out;if(capPend(b))return capWhy(b);
-  const sf=bizSf(b);if(sf<0.95)out.push(T.fiber?tr('customers.their_fiber_is_down'):tr('customers.getting_only_p_of_the_bandwidth',{p:pct(sf)}));
-  if(!(T.l2||T.fiber)&&R.reach<=0.99&&!localServiceOn())out.push(tr('customers.you_cannot_reach_the_whole_internet',{p:pct(R.reach)}));
+  const sf=bizSf(b);if(sf<0.95){const o=T.orbit?pieShortWhy(b):'';out.push((T.fiber?tr('customers.their_fiber_is_down'):tr('customers.getting_only_p_of_the_bandwidth',{p:pct(sf)}))+(o?'. '+o:''));}
+  if(!(T.l2||T.fiber)&&reachSolo()<=0.99&&!scnRule('local'))out.push(tr('customers.you_cannot_reach_the_whole_internet',{p:pct(reachSolo())}));
   if(b.type==='scrub'&&!hasScrub())out.push(tr('common.needs_a_scrubbing_center'));
   {const q=b.type==='scrub'&&scrubFar(b.city);if(q)out.push(tr('customers.attacks_on_city_are_hauled_to',{city:CITY[b.city].name,to:CITY[q.to].name,ms:Math.round(q.ms)}));}
   for(const k of b.reqs||[])if(REQS[k]&&!REQS[k].ok(b))out.push(typeof REQS[k].l==='function'?REQS[k].l(b):REQS[k].l);
@@ -13,8 +13,9 @@ const custStats=()=>{const bz=S.biz.filter(b=>!BIZ_T[b.type].event),mo=bz.reduce
   return {n:bz.length,unhappy:bz.filter(b=>b.mood<60).length,furious:bz.filter(b=>b.mood<30).length,avg:bz.length?(mo>0?bz.reduce((a,b)=>a+b.mood*bizMo(b),0)/mo:bz.reduce((a,b)=>a+b.mood,0)/bz.length):100,risk:bz.filter(b=>b.mood<60).reduce((a,b)=>a+bizMo(b),0)};};
 // Long lists show their first rows and grow on request: a thousand rows of buttons take the browser a long time to
 // lay out again every day, worst of all on a phone. Filters, sorting and totals still cover every row.
-const LIST_PAGE=100,listN=k=>(UI.listN&&UI.listN[k])||LIST_PAGE,listReset=k=>{if(UI.listN)delete UI.listN[k];};
-const listMore=(k,n,lab)=>n>listN(k)?`<div class="btns" style="margin-top:6px">${btn(lab(Math.min(LIST_PAGE,n-listN(k))),'listMore',{k},'ghost sm')}</div>`:'';
+// Links and Routers open on their top 10, so the first look fits the window, then grow 50 at a time.
+const LIST_PAGE=100,LIST_PG={links:[10,50],routers:[10,50]},listPg=k=>LIST_PG[k]?LIST_PG[k][1]:LIST_PAGE,listN=k=>(UI.listN&&UI.listN[k])||(LIST_PG[k]?LIST_PG[k][0]:LIST_PAGE),listReset=k=>{if(UI.listN)delete UI.listN[k];};
+const listMore=(k,n,lab,cls)=>n>listN(k)?`<div class="btns${cls?' '+cls:''}"${cls?'':' style="margin-top:6px"'}>${btn(lab(Math.min(listPg(k),n-listN(k))),'listMore',{k},'ghost sm')}</div>`:'';
 function custSection(){const F=UI.kf||{};let h=`<div class="panel2" id="custSec" style="margin-top:12px"><h3>${tr('common.customers')}</h3>`;
   if(!S.biz.length)return h+`<p class="empty">${tr('customers.no_customers_yet_offers_show_up')}</p></div>`;
   const st=custStats();
@@ -30,5 +31,5 @@ function custSection(){const F=UI.kf||{};let h=`<div class="panel2" id="custSec"
   const trend=b=>b.pm===undefined||Math.abs(b.mood-b.pm)<0.05?'':b.mood>b.pm?' <span style="color:var(--eye)">▲</span>':' <span style="color:var(--bad)">▼</span>';
   const sorts=[['mood',tr('common.happiness')],['mo',tr('common.per_month')],['name',tr('common.name')],['city',tr('common.where')]];
   h+=`<div class="seg" style="margin-bottom:4px">${sorts.map(([k,l])=>btn(l+(sk===k?(dir>0?' ▲':' ▼'):''),'custSort',{k},sk===k?'pink sm':'ghost sm')).join('')}</div>`;
-  h+=rows.slice(0,listN('cust')).map(b=>{const why=bizWhy(b),grace=S.day-(b.since||0)<15;return `<div class="row"><div class="grow"><div class="nm">${esc(b.name)} <span class="meta">${esc(BIZ_T[b.type].l)}</span></div><div class="meta">${esc(where(b))} · ${BIZ_T[b.type].event?esc(bTerms(b)):tr('common.price_mo',{price:fmt$(bizMo(b))})}${grace?` · ${tr('common.provisioning_n_d_grace',{n:15-(S.day-(b.since||0))})}`:''}${clTermTxt(b)?' · '+clTermTxt(b):''}</div>${bRisk(b)}${why.length?`<div class="why">${why.map(esc).join(' · ')}</div>`:''}<div class="bar ${moodCls(b.mood)}"><i style="width:${b.mood}%"></i></div><div class="meta">${tr('common.happiness_p',{p:Math.round(b.mood)})}${trend(b)}</div></div>${btn(tr('common.open'),'custGo',{id:b.id},'ghost sm')}</div>`;}).join('');
+  h+=rows.slice(0,listN('cust')).map(b=>{const why=bizWhy(b),grace=S.day-(b.since||0)<15;const lt=pieLandTxt(b);return `<div class="row${UI.custHi===b.id?' hi':''}" data-cid="${b.id}"><div class="grow"><div class="nm">${esc(b.name)} <span class="meta">${esc(BIZ_T[b.type].l)}</span></div><div class="meta">${esc(where(b))}${lt?' · '+lt:''} · ${BIZ_T[b.type].event?esc(bTerms(b)):tr('common.price_mo',{price:fmt$(bizMo(b))})}${grace?` · ${tr('common.provisioning_n_d_grace',{n:15-(S.day-(b.since||0))})}`:''}${clTermTxt(b)?' · '+clTermTxt(b):''}</div>${bRisk(b)}${why.length?`<div class="why">${why.map(esc).join(' · ')}</div>`:''}<div class="bar ${moodCls(b.mood)}"><i style="width:${b.mood}%"></i></div><div class="meta">${tr('common.happiness_p',{p:Math.round(b.mood)})}${trend(b)}</div>${(x=>x?`<div class="btns">${x}</div>`:'')(pieXLinks(b,'noc'))}</div>${btn(tr('common.open'),'custGo',{id:b.id},'ghost sm')}</div>`;}).join('');
   return h+listMore('cust',rows.length,n=>trn('customers.n_more_customer',n))+`</div>`;}

@@ -238,8 +238,9 @@ and the TLS file names change on restart only. The certificate and key themselve
 | `listed` | `false` | A note for yourself: whether you mean to be in the registry |
 | `notifyURL` | off | An `https://` URL the relay POSTs to once per new relay release (see Versions and update notices). Anything else is refused |
 | `allowedOrigins` | `[]` | Web pages besides the game's that may connect from a browser: `https://example.org`, `https://*.example.org`, or `"*"` for any. See below |
+| `legacyAuth` | `true` | Whether players' games may prove their key the older way, not bound to the connection and the node's URL. Up-to-date games use the bound way with up-to-date relays; this will be switched off by default in a later release, once older games are gone: planned for relay 5.0.0, not before 2027-03-01. `relay_auth_total{form="legacy"}` counts the older auths your node still takes (and the log says so at most once an hour): once it stays at 0 for a few weeks, set `false` to take only the bound way |
 | `limits` | | `maxClients` 5000, `maxNodes` 64, `openPerAddr` 256, `connBurst` 120, `connsPerSec` 1, `msgsPerSec` 20. See below |
-| `budgets` | | How fast others can make the node keep more (network keys cost nothing to make), per hour, counted in memory only. New network keys (ones the node has no record of yet): `newKeysPerConn` 64, `newKeysPerAddr` 1024, `newKeysPerPeer` 20000 (per other server). Bytes of new records: `bytesPerConn` 16 MiB, `bytesPerAddr` 256 MiB, `bytesPerPeer` 2 GiB. Live states of networks without an announce: `liveKeysPerConn` 16, `liveKeysPerAddr` 256, `liveKeysPerPeer` 5000. High-water mark, past which only networks that already have an announce here may put (newcomers get `rate_limited` until there is room): `maxRecords` 20000000, `maxStoreBytes` 32 GiB, `maxHeapBytes` 6 GiB (or 4/5 of `GOMEMLIMIT` when lower), `minFreeDisk` 1 GiB. Players running many games, or many AI agents, from one address stay well inside the defaults. Records from this server's own nodes and the command line are not counted |
+| `budgets` | | How fast others can make the node keep more (network keys cost nothing to make), per hour, counted in memory only. New network keys (ones the node has no record of yet): `newKeysPerConn` 64, `newKeysPerAddr` 1024 (per IPv4 address or IPv6 /64; an IPv6 /56 gets twice and a /48 four times the per-address budgets in all, as for connections; when too many addresses are busy at once to count another, it waits), `newKeysPerPeer` 20000 (per registry server or configured neighbour; all other servers share one such budget, and their sessions also count against their address's). Records another server passes on that carry a receipt of a registry server or of your own server are not counted again, and records refused by a budget are asked for again every 10 minutes. Bytes of new records: `bytesPerConn` 16 MiB, `bytesPerAddr` 256 MiB, `bytesPerPeer` 2 GiB. Live states of networks without an announce: `liveKeysPerConn` 16, `liveKeysPerAddr` 256, `liveKeysPerPeer` 5000. High-water mark, past which only networks that already have an announce here may put (newcomers get `rate_limited` until there is room): `maxRecords` 20000000, `maxStoreBytes` 32 GiB, `maxHeapBytes` 6 GiB (or 4/5 of `GOMEMLIMIT` when lower), `minFreeDisk` 1 GiB. Players running many games, or many AI agents, from one address stay well inside the defaults. Records from this server's own nodes and the command line are not counted |
 
 ### Limits per address: many players or agents behind one address
 
@@ -354,7 +355,8 @@ minutes and your node dials it instead) and whether the session is `up`; each en
 `peers` says whether it is `auto` and whether this node `dialled` it.
 
 Automatic peers' addresses come from the registry, not from you, so your relay dials them only on public addresses: a
-name that resolves to a loopback, private, link-local or carrier-grade NAT address is refused, and no node URL is ever
+name that resolves to a loopback, private, link-local or carrier-grade NAT address (also inside an IPv6 address such as
+NAT64, 6to4 or Teredo) is refused, and no node URL is ever
 followed through a redirect. `relay join` without `--from` and `relay check-registry` treat the registry's URLs the
 same way. Neighbours, `--from` seeds and your own server's nodes may be on private addresses.
 
@@ -375,10 +377,13 @@ Shun votes always travel, whatever you choose, as long as the voting server is i
 your own server): only registry servers' votes can count, and a server known from gossip alone costs nothing to make up,
 so your node refuses the votes of any other (and keeps at most 8192 votes of any one server). A server may take records
 without passing them on. Your node keeps at most 4096 catalog entries (16 MB), 512 of them (2 MB) first heard from any one
-neighbour, each at most 60 KB (so any one fits a game's frame); servers that are not in the registry share 4 MB of
-that, since anyone can make one. It sends its catalog to a new neighbour a frame at a time as it reads, and reads nothing a new neighbour says about other servers until
+neighbour, each at most 60 KB (so any one fits a game's frame); servers that are not in the registry share 1024 entries
+and 4 MB of that, since anyone can make one, and never keep a registry server's entry out (the oldest of theirs makes
+way). It sends its catalog to a new neighbour a frame at a time as it reads, and reads nothing a new neighbour says about other servers until
 its own entry has checked. A neighbour that does not send its own entry within 30 seconds is dropped, and sessions with
-servers your node does not know yet take at most 8 of its `maxNodes` slots; your own server's nodes always get one.
+servers your node does not know yet take at most 8 of its `maxNodes` slots (a server it learned of but did not keep in
+its catalog counts as one it does not know), servers that are neither in the registry nor your neighbours at most half
+of them and 2 each, and one address (an IPv6 /64) at most 8; your own server's nodes always get one.
 
 ```json
 "neighbours": [
@@ -398,7 +403,7 @@ relay registry-file > federation/servers/SERVER_IDENTITY.json
 
 and open a pull request adding that file. CI runs `relay check-registry` on it: the file parses and fits 64 KB; its
 records are signed; the operator chain follows from the genesis by majority-signed changes; the server record is
-signed by a majority of the current operators and declares `noLogs: true`; no other server has the same name; and one
+signed by a majority of the current operators and declares `noLogs: true`; its name uses only ASCII letters, digits, single spaces and `- . ' & ! + _ : , ( ) /` and no other server has the same name; and one
 of your nodes answers a challenge signed with its node key over `wss://`. A failing check prints the step and the
 error code. You can run the same check yourself:
 
@@ -442,7 +447,8 @@ and stops new deals with it, nothing more.
 
 Players can **report** a network to the operators of a server they joined, with one of the same four reasons and no
 text. A report goes only to your server: your node keeps it 30 days (one per player and reported network, the newest;
-at most 20 new ones per player a day), passes it to your other nodes and to no other server, and shows it only in the
+at most 20 new ones per player a day and 60 an hour from one address, 65536 in all, a quarter of which is kept for players
+it has known for a week or more, whose reports push out the newest players' oldest ones when it is full), passes it to your other nodes and to no other server, and shows it only in the
 operator panel of a game that proved your operator key (Reports: per network, the reasons with counts and how many
 players reported it). It changes nothing by itself: you decide whether to hide the network or vote.
 
@@ -513,6 +519,13 @@ How it works (`relay/internal/rank`):
      relay (it would refuse them); it sees the player's earlier announce, or none, until it is reloaded.
   To check which servers have upgraded: the looking glass shows each node's relay version, and `relay status` each
   peer's (every relay released after 4.0.0 takes `ix2`).
+- **Bound node proofs.** Every relay released after 4.0.0 binds the proof its nodes give in a handshake with another
+  node to that node (`bind`, spec 6.2), so a proof cannot be relayed to pass as a node. Such a relay takes an unbound
+  proof only from a server that is not in the registry, does not say (in its catalog entry) that it runs a relay
+  after 4.0.0, and has not bound its proofs in an earlier session; a session proved that way never keeps out or
+  replaces one that bound its proof. **Servers in the registry must run a relay after 4.0.0 to sync with up-to-date
+  servers.** The unbound form is a transition path only: it is planned to be removed in relay 5.0.0, and not before
+  2027-03-01; upgrade every node before then.
 - **Backups:** `relay backup FILE.tar.gz` writes the records, catalog, config and node key to a new file (mode 0600)
   that replaces `FILE.tar.gz` when complete (a symlink there is replaced, not followed). To keep backups in the data
   folder, write them into its `backups/` folder (made when needed): it, and any `*.tar.gz` in the data folder, is left
@@ -624,8 +637,10 @@ open in any browser, one player each, so you can play two networks against each 
 by IP address and join with the self-signed certificate (`--browser` works there too).
 
 The run's relays trust its self-signed certificate through the environment variable `RELAY_TEST_ROOTS` (a PEM file
-of certificates trusted besides the system's, for the relay's outgoing connections). It is for tests only: never set
-it on a real relay.
+of certificates trusted besides the system's, for the relay's outgoing connections), and may dial the run's other
+nodes on loopback through `RELAY_TEST_ALLOW_INTERNAL=1` (URLs from the registry, the catalog and other servers may
+then reach loopback and private addresses; the relay logs a warning at start). Both are for tests only: never set them
+on a real relay.
 
 ## Load test
 

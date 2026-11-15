@@ -62,44 +62,53 @@ type Options struct {
 
 // Relay is one node.
 type Relay struct {
-	o       Options
-	hc      *http.Client // outgoing wss:// to URLs the operator gave: no redirects
-	hcPeer  *http.Client // to URLs from the registry, catalog or peers: no redirects, public addresses only
-	mu      sync.Mutex
-	cfg     *config.Config
-	st      *store.Store
-	own     *chain.State // nil until the server's genesis is known
-	ownSrv  *fed.Record  // current server record (8.2)
-	headSrv *fed.Record  // newest valid server record at the chain's final head (for gossip)
-	hide    *fed.Record  // current hide record
-	reg     *registry.Snapshot
-	regs    map[string]*registry.Entry
-	cat     map[string]*catEntry
-	catVia  map[string]int // neighbour server -> catalog entries first learned from it
-	catSize catSizes       // bytes of the catalog's records, in all, per neighbour and unlisted
-	rank    *rank.Agg      // the leaderboards in memory (9.5)
-	shunned map[string]bool
-	shunAt  int64
-	counter *shun.Counter                   // voters of the registry snapshot
-	votes   map[string]map[string]shun.Vote // target -> vote id -> vote
-	voteN   map[string]int                  // voting server -> votes stored
-	ann     map[string]*store.Entry         // key -> its newest announce
-	offerN  map[string]int                  // author, and author|to -> offers stored
-	left    map[string]int64                // key -> t of its newest leave
-	statsAt map[string]int64                // key -> slot of its last stats from a client
-	refused map[string]bool                 // ids refused from nodes (not wanted again)
-	lastSyn map[string]int64                // peer node key -> start of the last session
-	auto    map[string]bool                 // this server's automatic peers (10.9), nil when none
-	quiet   map[string]int64                // automatic peer this node does not dial -> since when it has had no session with it
-	urlSrv  map[string]string               // node URL dialled -> the server that answered there
+	o        Options
+	hc       *http.Client // outgoing wss:// to URLs the operator gave: no redirects
+	hcPeer   *http.Client // to URLs from the registry, catalog or peers: no redirects, public addresses only
+	mu       sync.Mutex
+	cfg      *config.Config
+	conf     atomic.Pointer[config.Config] // cfg, for the reads per frame made without the lock
+	legacyN  atomic.Int64                  // client auths of the older, unbound form taken since start
+	legacyAt atomic.Int64                  // when one was last logged
+	st       *store.Store
+	own      *chain.State            // nil until the server's genesis is known
+	ownSrv   *fed.Record             // current server record (8.2)
+	headSrv  *fed.Record             // newest valid server record at the chain's final head (for gossip)
+	hide     *fed.Record             // current hide record
+	hides    map[string]*store.Entry // server -> its newest stored hide (this server's and registry servers')
+	reg      *registry.Snapshot
+	regs     map[string]*registry.Entry
+	cat      map[string]*catEntry
+	catVia   map[string]int // neighbour server -> catalog entries first learned from it
+	catViaUn map[string]int // of those, entries of servers the registry does not list
+	catUnN   int            // catalog entries of servers the registry does not list
+	catSize  catSizes       // bytes of the catalog's records, in all, per neighbour and unlisted
+	rank     *rank.Agg      // the leaderboards in memory (9.5)
+	shunned  map[string]bool
+	shunAt   int64
+	counter  *shun.Counter                   // voters of the registry snapshot
+	votes    map[string]map[string]shun.Vote // target -> vote id -> vote
+	voteN    map[string]int                  // voting server -> votes stored
+	ann      map[string]*store.Entry         // key -> its newest announce
+	offerN   map[string]int                  // author, and author|to -> offers stored
+	left     map[string]int64                // key -> t of its newest leave
+	statsAt  map[string]int64                // key -> slot of its last stats from a client
+	refused  map[string]bool                 // ids refused from nodes (not wanted again)
+	lastSyn  map[string]int64                // peer node key -> start of the last session
+	auto     map[string]bool                 // this server's automatic peers (10.9), nil when none
+	quiet    map[string]int64                // automatic peer this node does not dial -> since when it has had no session with it
+	urlSrv   map[string]string               // node URL dialled -> the server that answered there
+	binds    map[string]bool                 // other servers whose nodes bound their proofs in a session (memory only, bounded)
 
-	reports map[string]map[string]*store.Entry // reporter -> target -> its stored report (5.10)
-	addrQ   map[netip.Addr]*quota              // growth budgets by address, memory only (growth.go)
-	peerQ   map[string]*quota                  // growth budgets by other server
-	hwAt    int64                              // when the heap and the free disk were last read
-	heap    int64                              // heap in use then
-	free    int64                              // free disk then (-1: unknown)
-	reportN int                                // reports stored
+	reports   map[string]map[string]*store.Entry // reporter -> target -> its stored report (5.10)
+	addrQ     map[netip.Prefix]*quota            // growth budgets by address, memory only (growth.go)
+	peerQ     map[string]*quota                  // growth budgets by other server ("": all servers outside the registry)
+	peerAddrQ map[netip.Addr]*quota              // growth budgets of sessions with those servers, by address
+	hwAt      int64                              // when the heap and the free disk were last read
+	heap      int64                              // heap in use then
+	free      int64                              // free disk then (-1: unknown)
+	reportN   int                                // reports stored
+	repYoung  map[*store.Entry]int64             // reports of reporters without history here -> their first announce's slot
 
 	clients map[*session]bool
 	nodes   map[*session]bool
@@ -120,6 +129,10 @@ type Relay struct {
 	catDirty bool       // the catalog file is behind
 	loading  bool       // reading the catalog file
 	catWrite sync.Mutex // one catalog file write at a time
+
+	// Catalog entries dropped because their chain forked from the one held (10.8), and when one was last logged.
+	forks      int
+	forkLogged int64
 }
 
 // New opens the data folder and rebuilds every index.
@@ -155,11 +168,12 @@ func New(o Options) (*Relay, error) {
 	}
 	var eb [6]byte
 	_, _ = rand.Read(eb[:])
-	r := &Relay{o: o, cfg: o.Config, st: st, regs: map[string]*registry.Entry{}, cat: map[string]*catEntry{}, catVia: map[string]int{}, catSize: catSizes{via: map[string]int{}},
+	r := &Relay{o: o, cfg: o.Config, st: st, regs: map[string]*registry.Entry{}, cat: map[string]*catEntry{}, catVia: map[string]int{}, catViaUn: map[string]int{}, catSize: catSizes{via: map[string]int{}, viaUn: map[string]int{}},
 		shunned: map[string]bool{}, left: map[string]int64{}, statsAt: map[string]int64{}, refused: map[string]bool{},
-		lastSyn: map[string]int64{}, addrQ: map[netip.Addr]*quota{}, peerQ: map[string]*quota{}, urlSrv: map[string]string{}, clients: map[*session]bool{}, nodes: map[*session]bool{},
+		lastSyn: map[string]int64{}, addrQ: map[netip.Prefix]*quota{}, peerQ: map[string]*quota{}, urlSrv: map[string]string{}, binds: map[string]bool{}, clients: map[*session]bool{}, nodes: map[*session]bool{},
 		epoch: fed.Encode(eb[:]), dialers: map[string]context.CancelFunc{}, speaks: o.Versions,
 		hc: netguard.Client(o.HTTPClient, false), hcPeer: netguard.Client(o.HTTPClient, !o.AllowInternal)}
+	r.conf.Store(o.Config)
 	r.impl = &update.Impl{Name: update.Name, Version: r.version()}
 	if update.ReadImpl(r.impl.Value()) == nil {
 		r.impl.Version = "dev" // a build stamped with something no peer would read
@@ -188,6 +202,7 @@ func New(o Options) (*Relay, error) {
 		r.countOffer(e.Key, e.To(), 1)
 	}
 	r.indexReports()
+	r.indexHides()
 	// The registry first: the catalog's budget for servers not listed there is smaller.
 	r.loadRegistryCache()
 	r.loadCatalog()
@@ -312,6 +327,17 @@ func (r *Relay) lookup(id string) *chain.State {
 	}
 	if c, ok := r.cat[id]; ok {
 		return c.State
+	}
+	return nil
+}
+
+// receiptState is the chain state of a server whose receipts count: this server or a registry one.
+func (r *Relay) receiptState(id string) *chain.State {
+	if r.own != nil && id == r.own.ID {
+		return r.own
+	}
+	if e, ok := r.regs[id]; ok {
+		return e.State
 	}
 	return nil
 }
@@ -464,23 +490,67 @@ var (
 )
 
 // Bounds of reports (5.10; vars so tests can lower them): one reporter's new reports per day (by
-// receipt slot, which the reporter cannot pick), and every report this node keeps.
+// receipt slot, which the reporter cannot pick), and every report this node keeps. Keys cost
+// nothing to make, so reporters without history here (their first announce this node holds is
+// younger than reportElder) may fill only the room left after reportReserve (-1: a quarter), and a
+// reporter with history takes the place of the oldest report of the newest key when the node is
+// full. Reports from games are also counted per address, maxReportsPerAddr an hour.
 var (
-	maxReportsPerDay = 20
-	maxReports       = 65536
+	maxReportsPerDay  = 20
+	maxReports        = 65536
+	maxReportsPerAddr = 60
+	reportReserve     = -1
+	reportElder       = int64(7 * fed.Day)
 )
+
+// reserved is the room for reports kept for reporters with history.
+func reserved() int {
+	if reportReserve >= 0 {
+		return reportReserve
+	}
+	return maxReports / 4
+}
+
+// firstAnn is the receipt slot of the oldest announce of key this node holds, or now (lock held).
+func (r *Relay) firstAnn(key string, now int64) int64 {
+	first := now
+	for e := range r.st.Key(key) {
+		if e.Kind == "announce" && e.Slot < first {
+			first = e.Slot
+		}
+	}
+	return first
+}
+
+// evictYoung drops the oldest report of the reporter whose first announce is the newest (lock held).
+func (r *Relay) evictYoung() bool {
+	var o *store.Entry
+	var of int64
+	for e, f := range r.repYoung {
+		if o == nil || f > of || f == of && (e.T < o.T || e.T == o.T && e.ID < o.ID) {
+			o, of = e, f
+		}
+	}
+	if o == nil {
+		return false
+	}
+	r.refuse(o.ID)
+	r.remove([]string{o.ID})
+	return true
+}
 
 // indexReports rebuilds the reports by reporter and target from the store (start). A report
 // replaced by a newer one stays in the files until they are rewritten: it goes again here.
 func (r *Relay) indexReports() {
-	r.reports, r.reportN = map[string]map[string]*store.Entry{}, 0
+	r.reports, r.reportN, r.repYoung = map[string]map[string]*store.Entry{}, 0, map[*store.Entry]int64{}
 	var gone []string
+	now := r.now()
 	for e := range r.st.Kind("report") {
 		rec := r.st.Rec(e)
 		if rec == nil {
 			continue
 		}
-		if old := r.noteReport(e, rec.Str("target")); old != nil {
+		if old := r.noteReport(e, rec.Str("target"), now); old != nil {
 			gone = append(gone, old.ID)
 		}
 	}
@@ -490,7 +560,7 @@ func (r *Relay) indexReports() {
 // noteReport indexes a stored report about target; it returns the report of the same reporter and
 // target that is no longer kept (the older one, which may be e itself), for the caller to remove
 // (lock held).
-func (r *Relay) noteReport(e *store.Entry, target string) *store.Entry {
+func (r *Relay) noteReport(e *store.Entry, target string, now int64) *store.Entry {
 	by := r.reports[e.Key]
 	if by == nil {
 		by = map[string]*store.Entry{}
@@ -506,8 +576,29 @@ func (r *Relay) noteReport(e *store.Entry, target string) *store.Entry {
 	by[target] = e
 	if cur == nil {
 		r.reportN++
+	} else {
+		delete(r.repYoung, cur)
+	}
+	if f := r.firstAnn(e.Key, now); now-f < reportElder {
+		r.repYoung[e] = f
 	}
 	return cur
+}
+
+// indexHides rebuilds the newest hide per server from the store (start, and after hides were
+// removed; few are kept).
+func (r *Relay) indexHides() {
+	r.hides = map[string]*store.Entry{}
+	for e := range r.st.Kind("hide") {
+		h := r.st.Rec(e)
+		if h == nil {
+			continue
+		}
+		srv := h.Str("server")
+		if cur := r.hides[srv]; cur == nil || newer(e.T, e.ID, cur.T, cur.ID) {
+			r.hides[srv] = e
+		}
+	}
 }
 
 // dropReport takes a removed report out of the index (lock held).
@@ -516,6 +607,7 @@ func (r *Relay) dropReport(e *store.Entry) {
 	for target, x := range by {
 		if x == e {
 			delete(by, target)
+			delete(r.repYoung, e)
 			r.reportN--
 			break
 		}
@@ -551,8 +643,21 @@ func (r *Relay) reportCheck(rec *fed.Record, now int64, o origin) string {
 			day++
 		}
 	}
-	if day >= maxReportsPerDay || cur == nil && r.reportN >= maxReports {
+	if day >= maxReportsPerDay {
 		return fed.TooMany
+	}
+	if cur == nil {
+		young := now-r.firstAnn(rec.Key, now) < reportElder
+		if young && (len(r.repYoung) >= maxReports-reserved() || r.reportN >= maxReports) ||
+			!young && r.reportN >= maxReports && len(r.repYoung) == 0 {
+			return fed.TooMany
+		}
+	}
+	// A game's reports also count by its address: keys cost nothing to make.
+	if o.sess != nil && o.sess.addr.IsValid() {
+		if q := quotaOf(r, r.addrQ, addrLevels(o.sess.addr)[0].p, now); q == nil || q.reports.left(now, float64(maxReportsPerAddr)) < 1 {
+			return fed.RateLimited
+		}
 	}
 	return ""
 }
@@ -742,6 +847,11 @@ func (r *Relay) stateCheck(rec *fed.Record, now int64, o origin) string {
 		if code := r.own.ServerShape(rec); code != "" {
 			return code
 		}
+		if rec.Str("head") != r.own.Head {
+			// New server records only at the final head (8.2): keys removed since could still sign at
+			// the heads where they were operators.
+			return fed.BadChain
+		}
 		if l := r.own.At[rec.Str("head")]; !l.IsOperator(rec.Key) || r.strangers(rec) {
 			return fed.NotOperator
 		}
@@ -749,12 +859,19 @@ func (r *Relay) stateCheck(rec *fed.Record, now int64, o origin) string {
 			return fed.TooOld
 		}
 	case "hide":
-		st := r.lookup(rec.Str("server"))
+		// Only hides of this server and of registry servers are kept and passed on (8.3), like
+		// votes: a server known from gossip alone costs nothing to make up. One per server, the
+		// newest: an older one is refused, a newer one replaces it at once (after).
+		srv := rec.Str("server")
+		st := r.receiptState(srv)
 		if st == nil {
 			return fed.UnknownSrv
 		}
 		if !st.IsOperator(rec.Key) {
 			return fed.NotOperator
+		}
+		if cur := r.hides[srv]; cur != nil && cur.ID != rec.ID && newer(cur.T, cur.ID, rec.T, rec.ID) {
+			return fed.Refused
 		}
 	case "shun", "unshun":
 		// Only votes that can count are kept and passed on (8.3): those of registry servers (10.7
@@ -776,6 +893,14 @@ func (r *Relay) stateCheck(rec *fed.Record, now int64, o origin) string {
 		if r.voteN[srv] >= maxVotesPerServer && r.st.Get(rec.ID) == nil {
 			return fed.TooMany
 		}
+	case "announce":
+		// A network's founded never changes (5.1): an announce saying another day than the key's
+		// newest here is refused, so no one claims the newcomer price late or an old network early.
+		if cur := r.ann[rec.Key]; cur != nil && cur.ID != rec.ID {
+			if x := r.st.Rec(cur); x != nil && x.Int("founded") != rec.Int("founded") {
+				return fed.Refused
+			}
+		}
 	case "offer":
 		to, _ := rec.Body["to"].(string)
 		if r.st.Get(rec.ID) == nil && (r.offerN[rec.Key] >= maxOffersPerKey || r.offerN[rec.Key+"|"+to] >= maxOffersPerPair) {
@@ -787,7 +912,9 @@ func (r *Relay) stateCheck(rec *fed.Record, now int64, o origin) string {
 	return ""
 }
 
-// validReceipts keeps the receipts that check against servers this node knows.
+// validReceipts keeps the receipts that check against servers whose receipts count (6.1): this
+// server and registry servers. A server known from gossip alone costs nothing to make up (8.3), so
+// its receipts could date any record to any slot.
 func (r *Relay) validReceipts(rec *fed.Record, list []any, now int64) ([]map[string]any, int64) {
 	var out []map[string]any
 	slot := int64(0)
@@ -799,7 +926,7 @@ func (r *Relay) validReceipts(rec *fed.Record, list []any, now int64) ([]map[str
 		if !ok {
 			continue
 		}
-		st := r.lookup(srv)
+		st := r.receiptState(srv)
 		if st == nil {
 			continue
 		}
@@ -828,18 +955,19 @@ func (r *Relay) ingest(rec *fed.Record, rcpts []any, o origin) (string, map[stri
 	if o.client && rec.Kind == "stats" && r.statsAt[rec.Key] == fed.Slot(now) && r.st.Get(rec.ID) == nil {
 		return "", nil, fed.RateLimited
 	}
-	refs, newKey, code := r.growthCheck(rec, now, o)
+	var mine map[string]any
+	var list []map[string]any
+	var slot int64
+	existing := r.st.Get(rec.ID)
+	if existing == nil && !o.client {
+		list, slot = r.validReceipts(rec, rcpts, now)
+	}
+	refs, newKey, code := r.growthCheck(rec, now, o, list)
 	if code != "" {
 		r.o.Metrics.Inc("relay_refused_total", code)
 		return "", nil, code
 	}
-	var mine map[string]any
-	var list []map[string]any
-	var slot int64
-	if existing := r.st.Get(rec.ID); existing == nil {
-		if !o.client {
-			list, slot = r.validReceipts(rec, rcpts, now)
-		}
+	if existing == nil {
 		if len(list) == 0 {
 			cc := ""
 			if o.client {
@@ -864,6 +992,11 @@ func (r *Relay) ingest(rec *fed.Record, rcpts []any, o origin) (string, map[stri
 	}
 	if res == store.Stored {
 		charge(refs, newKey, e)
+		if rec.Kind == "report" && o.sess != nil && o.sess.addr.IsValid() {
+			if q := r.addrQ[addrLevels(o.sess.addr)[0].p]; q != nil {
+				q.reports.n--
+			}
+		}
 	}
 	if o.client && rec.Kind == "stats" {
 		r.statsAt[rec.Key] = fed.Slot(now)
@@ -896,9 +1029,22 @@ func (r *Relay) after(e *store.Entry, rec *fed.Record, cc string, now int64) {
 		r.countOffer(e.Key, e.To(), 1)
 	case "report":
 		// One per reporter and target, the newest (5.10): the older one goes.
-		if old := r.noteReport(e, rec.Str("target")); old != nil {
+		if old := r.noteReport(e, rec.Str("target"), now); old != nil {
 			r.refuse(old.ID)
 			r.remove([]string{old.ID})
+		}
+		// Past the bound (a reporter with history came, reportCheck): the newest key's oldest goes.
+		for r.reportN > maxReports && r.evictYoung() {
+		}
+	case "hide":
+		// One per server, the newest (5.7): the one it replaces goes now, not at retention.
+		srv := rec.Str("server")
+		if cur := r.hides[srv]; cur == nil || newer(e.T, e.ID, cur.T, cur.ID) {
+			r.hides[srv] = e
+			if cur != nil && cur != e {
+				r.refuse(cur.ID)
+				r.remove([]string{cur.ID})
+			}
 		}
 	}
 	switch rec.Kind {
@@ -1168,7 +1314,7 @@ func (r *Relay) gc() {
 
 // remove drops records from the store and from what is indexed beside it (lock held).
 func (r *Relay) remove(ids []string) {
-	votes := false
+	votes, hides := false, false
 	anns := map[string]bool{}
 	for _, id := range ids {
 		e := r.st.Get(id)
@@ -1188,9 +1334,14 @@ func (r *Relay) remove(ids []string) {
 			r.countOffer(e.Key, e.To(), -1)
 		case "report":
 			r.dropReport(e)
+		case "hide":
+			hides = true
 		}
 	}
 	r.st.Remove(ids)
+	if hides {
+		r.indexHides()
+	}
 	for k := range anns {
 		r.reindexAnn(k)
 		r.rank.Announce(k, r.newestAnn(k))
@@ -1261,7 +1412,8 @@ func (r *Relay) expired(now int64) []string {
 			}
 		}
 	}
-	// Hide: the newest per server.
+	// Hide: the newest per server, of this server and registry servers only (older relays kept
+	// those of servers known from gossip). Without a registry snapshot yet, others wait for one.
 	newest := map[string]*fed.Record{}
 	for e := range r.st.Kind("hide") {
 		h := r.st.Rec(e)
@@ -1270,8 +1422,10 @@ func (r *Relay) expired(now int64) []string {
 			newest[s] = h
 		}
 	}
+	regKnown := r.reg != nil || r.cfg.Registry == ""
 	for e := range r.st.Kind("hide") {
-		if h := r.st.Rec(e); newest[h.Str("server")] != h {
+		h := r.st.Rec(e)
+		if newest[h.Str("server")] != h || regKnown && r.receiptState(h.Str("server")) == nil {
 			drop = append(drop, e.ID)
 		}
 	}
@@ -1346,7 +1500,23 @@ func (r *Relay) Run() {
 		r.fresh(r.now())
 		r.mu.Unlock()
 	})
-	go r.refreshRegistry()
+	// Tracked like the loops: it writes the registry cache and may send an update notice, never after Close.
+	r.spawn(r.refreshRegistry)
+}
+
+// spawn runs f in a goroutine Close waits for; once Close has begun, it runs nothing and returns false.
+func (r *Relay) spawn(f func()) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ctx.Err() != nil {
+		return false
+	}
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		f()
+	}()
+	return true
 }
 
 func (r *Relay) loop(name string, every time.Duration, f func()) {
@@ -1397,6 +1567,7 @@ func addrLimits(c *config.Config) privacy.Limits {
 func (r *Relay) Reload(c *config.Config) {
 	r.mu.Lock()
 	r.cfg = c
+	r.conf.Store(c)
 	r.limiter.Set(addrLimits(c))
 	r.mu.Unlock()
 	r.reconcile()

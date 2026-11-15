@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"math/big"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
@@ -26,10 +27,9 @@ import (
 // with servers this node does not know yet, so they never take the slots of servers it knows.
 var verifyTimeout = 30 * time.Second
 
-const (
-	maxHeld       = 1 << 20
-	maxUnverified = 8
-)
+const maxHeld = 1 << 20
+
+var maxUnverified = 8
 
 func nonce() string {
 	var b [32]byte
@@ -40,7 +40,7 @@ func nonce() string {
 // answerNode is the answering side of a node handshake (9.4).
 func (r *Relay) answerNode(s *session, h *wire.Hello) {
 	r.mu.Lock()
-	ok := r.serving() && r.nodeRoom(h.Server)
+	ok := r.serving() && r.nodeRoom(h.Server, s.addr)
 	own := r.cfg.Server
 	r.mu.Unlock()
 	if !ok {
@@ -48,9 +48,14 @@ func (r *Relay) answerNode(s *session, h *wire.Hello) {
 		return
 	}
 	// A caller that claims this server must bind its proofs (6.2): nodes of one server are
-	// upgraded together, and an unbound proof can be had from any node by asking it.
+	// upgraded together, and an unbound proof can be had from any node by asking it. So must one
+	// that claims a registry server or a server known to bind: an unbound proof would let anyone
+	// pass as its node.
 	bind := slices.Contains(h.Feats, wire.FeatBind)
-	if !bind && h.Server == own {
+	r.mu.Lock()
+	must := h.Server == own || r.mustBind(h.Server)
+	r.mu.Unlock()
+	if !bind && must {
 		s.fail(0, fed.BadChallenge, 0)
 		return
 	}
@@ -84,12 +89,48 @@ func (r *Relay) answerNode(s *session, h *wire.Hello) {
 	// Proved: node bounds from here on, and no longer a handshake waiting.
 	s.becomeNode()
 	s.shook()
+	s.unbound = !bind
 	r.runPeer(s, h.Server, h.Node)
 }
 
+// bindSince is the last relay release whose nodes did not bind their handshake proofs: a server
+// whose nodes say they run a later one binds.
+const bindSince = "4.0.0"
+
+// maxBinds bounds the servers remembered as binding.
+const maxBinds = 1 << 13
+
+// mustBind reports whether a node of server must prove itself with a bound proof (lock held): a
+// registry server (every relay that can be listed now binds), a server whose catalog entry says
+// its nodes run a relay that binds, or one that bound in an earlier session.
+func (r *Relay) mustBind(server string) bool {
+	if r.regs[server] != nil || r.binds[server] {
+		return true
+	}
+	if c := r.cat[server]; c != nil {
+		for _, im := range c.Impl {
+			if im.Name == update.Name && update.Newer(im.Version, bindSince) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// noteBinds remembers that a verified session with a node of another server bound its proof (lock held).
+func (r *Relay) noteBinds(s *session) {
+	if s.same || s.unbound || !s.verified || r.lookup(s.peerServer) == nil || r.binds[s.peerServer] {
+		return
+	}
+	if len(r.binds) >= maxBinds {
+		clear(r.binds)
+	}
+	r.binds[s.peerServer] = true
+}
+
 // dialNode connects to another node and runs the session until it ends; dialer is the key of
-// the dialer in r.dialers.
-func (r *Relay) dialNode(ctx context.Context, dialer, url string) error {
+// the dialer in r.dialers, live its lifetime, and ctx bounds the dial.
+func (r *Relay) dialNode(ctx, live context.Context, dialer, url string) error {
 	// An automatic peer's URL comes from the registry or the catalog, not from the operator.
 	hc := r.hc
 	if strings.HasPrefix(dialer, autoPrefix) {
@@ -104,7 +145,7 @@ func (r *Relay) dialNode(ctx context.Context, dialer, url string) error {
 		return errClosed
 	}
 	s := newSession(r, c) // client bounds until the peer's proof checks
-	s.dialURL, s.dialer = url, dialer
+	s.dialURL, s.dialer, s.dialing = url, dialer, live
 	defer s.end()
 	r.mu.Lock()
 	own := r.cfg.Server
@@ -132,9 +173,12 @@ func (r *Relay) dialNode(ctx context.Context, dialer, url string) error {
 	theirs, _ := f.Str("nonce")
 	feats := wire.Feats(f.Raw["feats"])
 	bind := slices.Contains(feats, wire.FeatBind)
+	r.mu.Lock()
+	legacy := !bind && server != own && !r.mustBind(server)
+	r.mu.Unlock()
 	pv, code := canon.Check(f.Raw["proof"])
 	if code == "" {
-		code = fed.CheckNodeProof(pv, mine, server, node, r.now(), r.Key(), fed.RoleAnswer, !bind && server != own)
+		code = fed.CheckNodeProof(pv, mine, server, node, r.now(), r.Key(), fed.RoleAnswer, legacy)
 	}
 	if code != "" || !slices.Contains(r.speaks, ver) || !fed.IsID(theirs) {
 		s.fail(0, fed.BadChallenge, 0)
@@ -158,6 +202,7 @@ func (r *Relay) dialNode(ctx context.Context, dialer, url string) error {
 		proof = r.o.Node.MakeBoundProof(theirs, own, node, fed.RoleCall, r.now())
 	}
 	s.becomeNode()
+	s.unbound = !bind
 	s.enqueue(map[string]any{"m": "proof", "proof": proof})
 	r.runPeer(s, server, node)
 	return nil
@@ -178,10 +223,37 @@ func (r *Relay) siblingAt(node, url string) bool {
 	return false
 }
 
-// nodeRoom reports whether a session with a node of server may start (lock held). This server's
-// own nodes always may: they are few, and must never be locked out by others. Other servers share
-// MaxNodes, and servers this node knows nothing of yet (which may be made up) at most maxUnverified.
-func (r *Relay) nodeRoom(server string) bool {
+// Bounds of inbound sessions with other servers' nodes (vars for tests): from one address (an IPv6
+// /64), and with servers outside the registry that are not configured neighbours, which may be
+// made up: per server, and in all as a share of MaxNodes (1/unlistedShare).
+var (
+	maxNodesPerAddr     = 8
+	maxNodesPerUnlisted = 2
+	unlistedShare       = 2
+)
+
+// listedPeer reports whether server is in the registry or one of its nodes is a configured
+// neighbour (lock held): one whose sessions are not bounded as made up.
+func (r *Relay) listedPeer(server string) bool {
+	if r.regs[server] != nil {
+		return true
+	}
+	if st := r.lookup(server); st != nil {
+		for _, n := range st.Nodes {
+			if r.cfg.Neighbour(n.URL) != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// nodeRoom reports whether a session with a node of server, from addr, may start (lock held). This
+// server's own nodes always may: they are few, and must never be locked out by others. Other
+// servers share MaxNodes, servers this node knows nothing of yet (which may be made up) at most
+// maxUnverified, and servers outside the registry half of it; one address and one such server
+// have a few each.
+func (r *Relay) nodeRoom(server string, addr netip.Addr) bool {
 	if r.own != nil && server == r.own.ID {
 		return true
 	}
@@ -190,16 +262,30 @@ func (r *Relay) nodeRoom(server string) bool {
 	if r.auto[server] {
 		return true
 	}
-	others, unverified := 0, 0
+	others, unverified, fromAddr, unlisted, ofServer := 0, 0, 0, 0, 0
 	for s := range r.nodes {
 		if !s.same && !r.auto[s.peerServer] {
 			others++
-			if !s.verified {
+			if addr.IsValid() && s.addr == addr {
+				fromAddr++
+			}
+			if !r.listedPeer(s.peerServer) {
+				unlisted++
+			}
+			if s.peerServer == server {
+				ofServer++
+			}
+			// A peer is verified by its own entry even when the catalog had no room to keep it:
+			// it still counts as a server this node does not know.
+			if !s.verified || r.lookup(s.peerServer) == nil {
 				unverified++
 			}
 		}
 	}
-	if others >= r.cfg.Limits.MaxNodes {
+	if others >= r.cfg.Limits.MaxNodes || fromAddr >= maxNodesPerAddr {
+		return false
+	}
+	if !r.listedPeer(server) && (ofServer >= maxNodesPerUnlisted || unlisted >= max(1, r.cfg.Limits.MaxNodes/unlistedShare)) {
 		return false
 	}
 	return r.lookup(server) != nil || unverified < min(maxUnverified, r.cfg.Limits.MaxNodes)
@@ -209,6 +295,12 @@ func (r *Relay) nodeRoom(server string) bool {
 func (r *Relay) runPeer(s *session, server, node string) {
 	s.peerServer, s.peerNode = server, node
 	r.mu.Lock()
+	if s.dialing != nil && s.dialing.Err() != nil {
+		// Its dialer stopped during the handshake (reconcile, under r.mu): nothing would close it later.
+		r.mu.Unlock()
+		s.close("")
+		return
+	}
 	s.same = r.own != nil && server == r.own.ID
 	if s.same {
 		if !r.own.IsNode(node) {
@@ -240,6 +332,7 @@ func (r *Relay) runPeer(s *session, server, node string) {
 		r.mu.Unlock()
 		return
 	}
+	r.noteBinds(s)
 	r.nodes[s] = true
 	if s.same {
 		// Which node of this server dials the automatic peers depends on which siblings are up.
@@ -256,6 +349,9 @@ func (r *Relay) runPeer(s *session, server, node string) {
 	}
 	r.mu.Unlock()
 	r.o.Log.Info("sync: session up", "server", server, "node", node, "same", s.same)
+	if !s.same {
+		r.spawn(func() { r.retryLater(s) })
+	}
 	defer func() {
 		r.mu.Lock()
 		delete(r.nodes, s)
@@ -340,6 +436,7 @@ func (r *Relay) setClasses(s *session, st *chain.State) {
 			}
 		}
 	}
+	s.neighbour = n != nil
 	switch {
 	case n != nil:
 		s.send, s.take = config.Or(n.Send), config.Or(n.Take)
@@ -405,9 +502,19 @@ func (r *Relay) nodeFrame(s *session, f *wire.Frame) bool {
 		s.enqueue(map[string]any{"m": "pong", "id": f.ID, "now": now})
 	case "pong":
 	case "err":
+		// The peer chooses the code: at most 32 bytes of it reach the log.
 		code, _ := f.Str("code")
+		if len(code) > 32 {
+			code = strings.ToValidUTF8(code[:32], "") + "…"
+		}
 		r.o.Log.Info("sync: peer reported", "code", code)
 	case "carry":
+		// Answered once per session (9.4: it starts the sync): each answer walks the whole store.
+		if s.carried {
+			r.o.Metrics.Inc("relay_refused_total", "carry_again")
+			return true
+		}
+		s.carried = true
 		since, _ := wire.Int(f.Raw["since"])
 		ids := r.inventory(s, since) // returns with the lock held
 		for i := 0; i < len(ids) || i == 0; i += fed.MaxInv {
@@ -592,13 +699,56 @@ func (r *Relay) takePushed(s *session, x any, now int64) {
 	r.mu.Lock()
 	delete(s.wanted, rec.ID)
 	// unknown_server is not for good: the server may be learned later; rate_limited (a growth
-	// budget, growth.go) neither: the record comes again in a later session.
-	if code != "" && code != fed.UnknownSrv && code != fed.RateLimited {
+	// budget, growth.go) neither: the record is asked for again once the budget had time to refill
+	// (retryLater), and comes again in a later session anyway.
+	switch {
+	case code == fed.RateLimited:
+		if s.retry == nil {
+			s.retry = map[string]bool{}
+		}
+		if len(s.retry) < maxRetry {
+			s.retry[rec.ID] = true
+		}
+	case code != "" && code != fed.UnknownSrv:
 		r.refuse(rec.ID)
 	}
 	r.mu.Unlock()
 	if code != "" {
 		r.o.Log.Info("sync: dropped record", "kind", rec.Kind, "key", rec.Key, "code", code)
+	}
+}
+
+// retryEvery is how often a session asks again for records refused rate_limited (a var for
+// tests); maxRetry bounds the ids it remembers for that.
+var retryEvery = 10 * time.Minute
+
+const maxRetry = fed.MaxInv
+
+// retryLater asks the peer again, every retryEvery while the session lasts, for the records it
+// pushed that a growth budget refused then.
+func (r *Relay) retryLater(s *session) {
+	t := time.NewTicker(retryEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-t.C:
+		}
+		r.mu.Lock()
+		var want []string
+		for id := range s.retry {
+			if r.st.Get(id) == nil && !r.refused[id] {
+				want = append(want, id)
+				s.wanted[id] = true
+			}
+		}
+		s.retry = nil
+		r.mu.Unlock()
+		if len(want) > 0 {
+			slices.Sort(want)
+			s.enqueue(map[string]any{"m": "want", "ids": strList(want)})
+		}
 	}
 }
 
@@ -654,10 +804,20 @@ func (r *Relay) reconcileLocked() {
 		if !want[key] && key != "bootstrap" {
 			stop()
 			delete(r.dialers, key)
+			srv := ""
+			if !strings.HasPrefix(key, autoPrefix) {
+				srv = r.serverOfURL(key)
+			}
 			for s := range r.nodes {
-				if s.dialer == key {
-					s.close("")
+				if s.dialer != key {
+					continue
 				}
+				if srv != "" && want[autoPrefix+srv] && s.peerServer == srv {
+					// A neighbour this node now dials as an automatic peer keeps its session, now the automatic one.
+					s.dialer = autoPrefix + srv
+					continue
+				}
+				s.close("")
 			}
 		}
 	}
@@ -699,7 +859,9 @@ func (r *Relay) dialLoop(ctx context.Context, key string, urls func() []string) 
 			url := list[next%len(list)]
 			r.mu.Lock()
 			srv := r.serverOfURL(url)
-			busy := srv != "" && (r.own == nil || srv != r.own.ID) && r.hasPeer(srv)
+			// Only a bound session keeps this node from dialling: one an impersonator holds with an
+			// unbound proof must not keep the real server out (dedupe closes it once the real one is up).
+			busy := srv != "" && (r.own == nil || srv != r.own.ID) && r.hasBoundPeer(srv)
 			r.mu.Unlock()
 			if busy {
 				select {
@@ -731,7 +893,9 @@ func (r *Relay) dialLoop(ctx context.Context, key string, urls func() []string) 
 func (r *Relay) dialOnce(ctx, dctx context.Context, key, url string) error {
 	// The dial itself is bounded by dctx; the session lives with ctx.
 	done := make(chan error, 1)
-	go func() { done <- r.dialNode(dctx, key, url) }()
+	if !r.spawn(func() { done <- r.dialNode(dctx, ctx, key, url) }) {
+		return errClosed
+	}
 	select {
 	case err := <-done:
 		return err

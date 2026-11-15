@@ -12,7 +12,9 @@ const FED={
   fetch:(u,o)=>fetch(u,o),idb:()=>indexedDB,registry:'federation/servers.json',
   // ms: opening a socket, a request's answer, ping when idle, give up when silent, the idle check, stats, back-off;
   // live states (§5.11): the check, the keepalive when nothing changed, the least time between two (s: statsMax, stateMin).
-  T:{open:15000,req:20000,idle:60000,dead:120000,tick:30000,stats:300000,statsMax:3600,first:5000,base:2000,cap:1800000,fetch:10000,state:10000,stateKeep:180000,stateMin:5},
+  T:{open:15000,req:20000,idle:60000,dead:120000,tick:30000,stats:300000,statsMax:3600,first:5000,base:2000,cap:1800000,fetch:10000,state:10000,stateKeep:180000,stateMin:5,
+    // The signature checks one connection may ask of this tab per sigWin seconds (fedBudget).
+    sigMax:30000,sigWin:60},
   hooks:{stats:null,deal:null},vgen:0,shun:null,xgen:0,ex:null,live:null,st:{},ev:{},soon:false,listening:false,sent:new Map(),ids:new WeakMap(),dpend:[],
   // Server id -> the newest relay its node told this device's operator about (§9.3 update), memory only.
   upd:{}};
@@ -50,10 +52,19 @@ function fedStatus(){const l=Object.entries(FED.st).map(([url,x])=>({url,...x}))
   const st=l.some(x=>x.state==='offline'||x.state==='waiting')?'offline':'connecting';
   return {state:st,since:l.length?Math.min(...l.map(x=>x.since)):null,servers:l};}
 function fedSt(c,state){const o=FED.st[c.url],up=state==='connected',was=!!o&&o.state==='connected';c.state=state;
-  FED.st[c.url]={state,since:o&&up===was?o.since:fedNow(),server:c.srv,node:c.node,impl:c.impl||null};
+  FED.st[c.url]={state,since:o&&up===was?o.since:fedNow(),server:fedSrvOk(c),node:c.node,impl:c.impl||null};
   if(!o||o.state!==state)fedEmit('status',fedStatus());}
 
 /* ---------- one connection per joined server, failing over between its nodes ---------- */
+/* c.srv is the server a welcome claimed; c.srvOk says whether that claim held: true once a node of it passed the node
+   check (§9.3), 'unknown' when the catalog knows no such server (nothing to check against, so it cannot pass for one
+   the catalog knows). Only then is anything the connection says attributed to that server (status, error log,
+   excluded lists, gossip paths), and only a checked server's other nodes are dialled when failing over. */
+const fedSrvOk=c=>c.srvOk?c.srv:null;
+// A welcome's claim did not hold: forget it, and anything the connection set under it.
+function fedUnclaim(c,L){const s=c.srv,cur=c.nodes[c.ni%c.nodes.length];c.srv=null;c.srvOk=false;c.nodeKey=null;c.nodes=[c.url];c.ni=0;if(FED.st[c.url])FED.st[c.url].server=null;
+  if(L){fedNodesSet(c,L);c.ni=Math.max(0,c.nodes.indexOf(cur));}
+  if(c.upd&&FED.upd[c.upd.srv]===c.upd.u){delete FED.upd[c.upd.srv];fedEmit('update',{srv:s});}c.upd=null;}
 function fedConnect(M,url){const c={M,url,nodes:[url],ni:0,ws:null,state:'idle',tries:0,t:null,tick:null,rq:new Map(),nid:0,srv:null,node:null,nodeKey:null,lastIn:0,lastOut:0,sub:0,phase:''};
   M.conns.set(url,c);fedDial(c);}
 const fedLive=c=>{if(fedMine(c.M)&&c.M.conns.get(c.url)===c)return true;if(FED.live===c.M&&!fedMine(c.M))fedWake();return false;};
@@ -81,15 +92,19 @@ function fedDial(c){if(!fedLive(c))return;fedHang(c);
    a connection stayed ready for FED_STEADY seconds: a node that hangs up right after the sub is not redialled every
    2 s. min: seconds to wait at least (a node's rate_limited retry). */
 const FED_STEADY=60;
-function fedDrop(c,why,min=0){fedErrLog(c.node,c.srv,why);fedHang(c);if(c.readyAt&&fedNow()-c.readyAt>=FED_STEADY)c.tries=0;c.readyAt=0;if(!fedLive(c))return;c.ni++;
+function fedDrop(c,why,min=0){fedErrLog(c.node,fedSrvOk(c),why);fedHang(c);if(c.readyAt&&fedNow()-c.readyAt>=FED_STEADY)c.tries=0;c.readyAt=0;if(!fedLive(c))return;c.ni++;
   if(c.ni%c.nodes.length===0)c.tries++;
   fedSt(c,'offline');
   c.calm=min?fedNow()+min:0;
   const wait=c.wait=Math.max(min*1000,c.ni%c.nodes.length?250:Math.min(FED.T.cap,FED.T.base*2**Math.min(20,Math.max(0,c.tries-1)))*(0.5+FED.rand()/2));
   c.t=FED.set(()=>fedDial(c),wait);}
-// The nodes of a connection's server, from the catalog: the joined URL first, then the others, for failing over.
-async function fedLearn(c,srvs){const e=c.srv&&(srvs||await fedServers()).find(x=>x.id===c.srv);if(!e||!fedLive(c))return null;
-  const cur=c.nodes[c.ni%c.nodes.length];c.nodes=[c.url,...e.nodes.map(n=>n.url).filter(u=>u!==c.url)];c.ni=Math.max(0,c.nodes.indexOf(cur));return e;}
+/* The nodes of a connection's server, from the catalog: the joined URL first, then the others, for failing over. The
+   server is the one a node of which passed the check, else the one the catalog lists the joined URL under: a welcome's
+   claim alone never sends us to another server's nodes. */
+async function fedLearn(c,srvs){const L=srvs||await fedServers();return fedLive(c)?fedNodesSet(c,L):null;}
+function fedNodesSet(c,L){const e=c.srv&&c.srvOk===true?L.find(x=>x.id===c.srv):L.find(x=>(x.nodes||[]).some(n=>n.url===c.url));if(!e)return null;
+  // Only public nodes to fail over to, unless the joined URL is itself local (fedHeardOk).
+  const cur=c.nodes[c.ni%c.nodes.length],loc=!fedPublicUrl(c.url);c.nodes=[c.url,...e.nodes.map(n=>n.url).filter(u=>u!==c.url&&fedHeardOk(u,loc))];c.ni=Math.max(0,c.nodes.indexOf(cur));return e;}
 async function fedLearnAll(M){if(!fedMine(M))return;const s=await fedServers();for(const c of M.conns.values())await fedLearn(c,s);}
 function fedSend(c,m){const t=JSON.stringify(m);if(!c.ws||fedSize(t)>FED_FRAME)return false;try{c.ws.send(t);c.lastOut=fedNow();return true;}catch(e){return false;}}
 // A request: resolves with the answer frame, or null on timeout or a lost connection. many: answers come as several
@@ -113,6 +128,8 @@ function fedIn(c,text){c.lastIn=fedNow();const r=fedFrame(text,'node');if(r.skip
     c.feats=Array.isArray(f.feats)?f.feats.slice(0,16).filter(x=>typeof x==='string'):[];
     // Whether this server takes ix2 fields, kept past the connection: the announce carries them only while all do (fedIx2).
     (FED.ix2||(FED.ix2={}))[c.url]=c.feats.includes('ix2');
+    // A node that binds auth (§9.3 bind) gives a nonce: our auth then names it and the URL we dialled.
+    c.anonce=c.feats.includes('bind')&&typeof f.nonce==='string'&&!FdId(f.nonce)?f.nonce:null;
     c.tick=FED.set(function tk(){if(!fedLive(c)||!c.ws)return;const n=fedNow();
       if(n-c.lastIn>=FED.T.dead/1000){fedDrop(c,'silent');return;}
       if(n-c.lastOut>=FED.T.idle/1000)fedSend(c,{m:'ping',id:c.nid=c.nid%2147483646+1});c.tick=FED.set(tk,FED.T.tick);},FED.T.tick);
@@ -121,6 +138,10 @@ function fedIn(c,text){c.lastIn=fedNow();const r=fedFrame(text,'node');if(r.skip
   if(f.m==='err'&&f.id===undefined){fedDrop(c,f.code,f.code==='rate_limited'?Math.min(3600,Math.max(1,Number.isSafeInteger(f.retry)?f.retry:1)):0);return;}
   if(c.phase!=='ready'&&c.phase!=='check'){fedDrop(c,'not_ready');return;}
   if(f.m==='ping'){fedSend(c,{m:'pong',id:f.id,now:fedNow()});return;}
+  // Until the node check and auth are done, only answers to our own requests (and an operator's update notice, which
+  // follows the ack of a proved operator key): nothing unasked is taken from a node whose server is not checked yet.
+  if(c.phase!=='ready'&&f.m!=='update'&&!(f.id!==undefined&&c.rq.has(f.id)))return;
+  if((f.m==='recs'||f.m==='catalog')&&!fedBudget(c,fedSigCost(f)))return;
   /* A page of the subscription: pages are handled one after another, and its cursor is kept only once every record of
      it was handled, so a connection lost in the middle resumes from the last whole page and skips nothing (§9.3). */
   if(f.m==='recs'&&c.sub&&f.id===c.sub){const k=fedCursorKey(c);
@@ -135,12 +156,12 @@ function fedIn(c,text){c.lastIn=fedNow();const r=fedFrame(text,'node');if(r.skip
   if(f.m==='err'&&c.rsub&&f.id===c.rsub){c.rsub=0;return;}
   if(f.m==='excluded'&&f.id===undefined){fedExclIn(c,f);return;}
   // A newer relay is out: a node tells sessions that proved an operator key of its server, no one else.
-  if(f.m==='update'&&f.id===undefined){const u=fedUpdOf(f);if(u&&c.srv){FED.upd[c.srv]=u;fedEmit('update',{srv:c.srv,...u});}return;}
+  if(f.m==='update'&&f.id===undefined){const u=fedUpdOf(f);if(u&&c.op&&c.srvOk===true){FED.upd[c.srv]=u;c.upd={srv:c.srv,u};fedEmit('update',{srv:c.srv,...u});}return;}
   // The node refused the subscription for now (rate_limited, internal): subscribe again after its retry.
   if(f.m==='err'&&c.sub&&f.id===c.sub){c.sub=0;if(f.code==='rate_limited'||f.code==='internal')c.subT=FED.set(()=>{c.subT=null;if(fedLive(c)&&c.phase==='ready'&&!c.sub)fedSub(c);},Math.min(60,Math.max(1,Number.isSafeInteger(f.retry)?f.retry:5))*1000);return;}
   // Unasked gossip is checked one frame at a time; a node that sends it faster than that is dropped (FED_HELD).
   if(f.m==='catalog'&&f.id===undefined){if(c.gosN>=FED_HELD){fedDrop(c,'slow');return;}c.gosN=(c.gosN||0)+1;
-    fedGossip(f.entries,c.srv).catch(()=>{}).finally(()=>{c.gosN--;});return;}
+    fedGossip(f.entries,fedSrvOk(c)).catch(()=>{}).finally(()=>{c.gosN--;});return;}
   const q=f.id!==undefined&&c.rq.get(f.id);
   if(!q)return;
   // A long answer (§9.3): recs items or catalog entries gathered over the frames until more is not true.
@@ -150,16 +171,32 @@ function fedIn(c,text){c.lastIn=fedNow();const r=fedFrame(text,'node');if(r.skip
 /* Pages of the subscriptions are handled one after another (each needs signature checks and storage). At most FED_HELD
    wait at once (64 KB each at most): a node that streams them faster than this tab can handle them would otherwise fill its memory. */
 const FED_HELD=256;
+/* Every signed record, receipt and registry entry a node sends costs this tab signature checks (in the worker, but a
+   worker kept busy forever still drains a phone). Each connection gets FED.T.sigMax of them per FED.T.sigWin seconds,
+   counted from what a frame asks for (fedSigCost) before any of it is checked, across reconnects; over it the frame is
+   not looked at and the node is dropped 'slow' until the window is over. A whole page is taken or none of it, so a
+   subscription's cursor never skips a page. */
+const fedSigN=r=>r&&typeof r==='object'&&Array.isArray(r.sigs)?Math.max(1,Math.min(64,r.sigs.length)):1;
+function fedSigCost(f){let n=0;
+  if(f.m==='recs'&&Array.isArray(f.items))for(const it of f.items){if(it&&typeof it==='object')n+=fedSigN(it.rec)+(Array.isArray(it.rcpt)?Math.min(16,it.rcpt.length):0);}
+  else if(f.m==='catalog'&&Array.isArray(f.entries))for(const e of f.entries.slice(0,256)){if(e&&typeof e==='object')n+=fedSigN(e.genesis)+fedSigN(e.server)+(Array.isArray(e.chain)?e.chain.slice(0,64).reduce((a,r)=>a+fedSigN(r),0):0);}
+  return n;}
+function fedBudget(c,n){const now=fedNow(),w=FED.T.sigWin;if(!c.sig||now-c.sig.t>=w)c.sig={t:now,n:0};
+  if(c.sig.n+n<=FED.T.sigMax){c.sig.n+=n;return true;}fedDrop(c,'slow',Math.max(1,c.sig.t+w-now));return false;}
 function fedSubQ(c,job){if((c.subN||0)>=FED_HELD){fedDrop(c,'slow');return;}c.subN=(c.subN||0)+1;const q=c.subQ||Promise.resolve();
   c.subQ=q.then(job).catch(()=>{}).finally(()=>{if(c.subN>0)c.subN--;});}
 /* Just connected: make sure the node is one of its server's (when the catalog knows the server: the registry is asked
    first, for at most FED.T.fetch), then send what waits and follow the news. */
-async function fedReady(c){await c.M.cat;if(!fedLive(c)||c.phase!=='check')return;const e=await fedLearn(c);
+async function fedReady(c){await c.M.cat;if(!fedLive(c)||c.phase!=='check')return;const L=await fedServers(),e=L.find(x=>x.id===c.srv);if(!fedLive(c)||c.phase!=='check')return;
   /* The node must be the server's node at the URL dialled: a server that claims another's identity could otherwise
      relay our challenge to a real node of it, then the auth we sign for it (§6.2, §9.3). */
-  if(e){if(!e.nodes.some(n=>n.key===c.nodeKey&&n.url===c.node)){fedDrop(c,'not_node');return;}
-    const nonce=fedB64(fedNonce()),p=await fedAsk(c,{m:'challenge',nonce});if(!fedLive(c)||c.phase!=='check')return;if(!p||p.m!=='proof'){fedDrop(c,'bad_challenge');return;}
-    if(await fedProofErr(p.proof,nonce,c.srv,c.nodeKey,fedNow())){fedDrop(c,'bad_challenge');return;}}
+  if(e){if(!e.nodes.some(n=>n.key===c.nodeKey&&n.url===c.node)){fedUnclaim(c,L);fedDrop(c,'not_node');return;}
+    const nonce=fedB64(fedNonce()),p=await fedAsk(c,{m:'challenge',nonce});if(!fedLive(c)||c.phase!=='check')return;if(!p||p.m!=='proof'){fedUnclaim(c,L);fedDrop(c,'bad_challenge');return;}
+    if(await fedProofErr(p.proof,nonce,c.srv,c.nodeKey,fedNow())){if(fedLive(c)&&c.phase==='check'){fedUnclaim(c,L);fedDrop(c,'bad_challenge');}return;}
+    if(!fedLive(c)||c.phase!=='check')return;c.srvOk=true;fedNodesSet(c,L);}
+  // A node at an address the catalog lists for a server must be that server's.
+  else if(L.some(x=>(x.nodes||[]).some(n=>n.url===c.node))){fedUnclaim(c,L);fedDrop(c,'not_node');return;}
+  else if(c.srvOk!==true)c.srvOk='unknown';
   if(!fedLive(c)||c.phase!=='check')return;await fedAuth(c);
   if(!fedLive(c)||c.phase!=='check')return;
   // What a sub gives depends on the key proved (deals only to their parties): without it, no sub and no cursor.
@@ -167,7 +204,7 @@ async function fedReady(c){await c.M.cat;if(!fedLive(c)||c.phase!=='check')retur
   c.phase='ready';c.readyAt=fedNow();fedSt(c,'connected');fedFlush(c);
   await fedSub(c);if(!fedLive(c)||c.phase!=='ready')return;if(c.op)await fedVoteSub(c);if(!fedLive(c)||c.phase!=='ready')return;
   if(c.op)await fedRepSub(c);if(!fedLive(c)||c.phase!=='ready')return;
-  const cat=await fedAskRetry(c,{m:'servers'},true);if(cat&&cat.m==='catalog')await fedGossip(cat.entries,c.srv);}
+  const cat=await fedAskRetry(c,{m:'servers'},true);if(cat&&cat.m==='catalog')await fedGossip(cat.entries,fedSrvOk(c));}
 /* Follows the news from the last cursor kept for this node and this network: IndexedDB is shared by every save slot,
    and what a sub gives depends on the key proved, so another network's cursor would skip this one's deals. */
 const fedCursorKey=c=>'cursor:'+c.node+'#'+c.M.fed.key.pub,fedVcKey=c=>c.node+'#'+c.M.fed.key.pub;
@@ -177,10 +214,10 @@ const fedCursorOk=x=>typeof x==='string'&&/^[A-Za-z0-9_-]{1,64}$/.test(x);
 /* Proves this network's key to the node (§9.3 auth), so it is told the reasons if the federation excluded it, then the
    operator key when this device has one of this server's: only then does the node send the shun votes. */
 async function fedAuth(c){const f=c.M.fed;c.me=null;if(!c.srv||!c.nodeKey)return;
-  const a=await fedAsk(c,{...await fedAuthMake(f.key.priv,c.nodeKey,c.srv,fedNow())});if(!fedLive(c))return;
+  const a=await fedAsk(c,{...await fedAuthMake(f.key.priv,c.nodeKey,c.srv,fedNow(),c.anonce,c.node)});if(!fedLive(c))return;
   c.me=a&&a.m==='ack'?f.key.pub:null;await fedAuthOp(c);}
 async function fedAuthOp(c){const k=await fedOpKey();if(!k||!fedLive(c)||c.op===k.pub||!fedOpOf(await fedServers(),c.srv,k.pub))return;
-  const a=await fedAsk(c,{...await fedAuthMake(k.seed,c.nodeKey,c.srv,fedNow())});if(!fedLive(c))return;
+  const a=await fedAsk(c,{...await fedAuthMake(k.seed,c.nodeKey,c.srv,fedNow(),c.anonce,c.node)});if(!fedLive(c))return;
   if(a&&a.m==='ack'&&a.op===true){c.op=k.pub;if(c.phase==='ready'){await fedVoteSub(c);await fedRepSub(c);}}}
 // The votes, for an operator: their own subscription, from their own cursor, so votes from before it are not skipped.
 async function fedVoteSub(c){const cur=(await fedGet('kv','vcursors'))||{},since=fedOwn(cur,fedVcKey(c))?cur[fedVcKey(c)]:'';if(!fedLive(c)||c.phase!=='ready'||c.vsub||!c.op)return;
@@ -204,7 +241,7 @@ function fedExclIn(c,f){const b=c.exBuf||(c.exBuf={keys:new Set(),reasons:new Se
   for(const k of f.keys.slice(0,8192))if(typeof k==='string'&&!FdK(k)&&b.keys.size<FED_EXCL_MAX)b.keys.add(k);
   if(Array.isArray(f.reasons))for(const r of f.reasons.slice(0,8))if(FED_REASONS.includes(r))b.reasons.add(r);
   if(f.more===true)return;c.exBuf=null;
-  const o={at:fedNow(),srv:c.srv,keys:[...b.keys].sort(fedByStr),me:c.me,reasons:c.me?[...b.reasons].sort():[]},kk=fedExclKey(c.url,c.M.fed.key.pub);
+  const o={at:fedNow(),srv:fedSrvOk(c),keys:[...b.keys].sort(fedByStr),me:c.me,reasons:c.me?[...b.reasons].sort():[]},kk=fedExclKey(c.url,c.M.fed.key.pub);
   FED.exQ=(FED.exQ||Promise.resolve()).then(()=>fedPut('kv',kk,o)).then(()=>{FED.xgen++;fedEmit('excluded',{server:o.srv,n:o.keys.length});}).catch(()=>{});}
 function fedNonce(){const a=new Uint8Array(32);try{crypto.getRandomValues(a);}catch(e){for(let i=0;i<32;i++)a[i]=FED.rand()*256|0;}return a;}
 
@@ -254,10 +291,13 @@ const fedPerf=()=>{try{return performance.now();}catch(e){return Date.now();}};
 FED.stCost={n:0,ms:0,idle:0};
 
 /* ---------- records from a node: checked, then kept where they belong ---------- */
-// Receipts: the earliest valid one gives the board slot (§10.1), and its country (a shared stats record only).
+/* Receipts: the earliest valid one gives the board slot (§10.1), and its country (a shared stats record only). Only
+   receipts of registry servers and of the server we are connected to count (§6.1): one known from gossip alone costs
+   nothing to make up, so its receipts could date a record to any slot. */
 async function fedPlace(c,chk,rcpts,now,srvs){let slot=null,cc=null;
   for(const rc of Array.isArray(rcpts)?rcpts.slice(0,16):[]){const sid=rc&&rc.body&&rc.body.server;if(typeof sid!=='string')continue;
-    const e=srvs.find(x=>x.id===sid),nodes=e?e.nodes.map(n=>n.key):sid===c.srv&&c.nodeKey?[c.nodeKey]:null;if(!nodes)continue;
+    const e=srvs.find(x=>x.id===sid),mine=sid===c.srv?[...(e?e.nodes.map(n=>n.key):[]),...(c.nodeKey?[c.nodeKey]:[])]:[];
+    const nodes=e&&e.source!=='gossip'?e.nodes.map(n=>n.key):mine.length?mine:null;if(!nodes)continue;
     if(await fedRcptErr(rc,chk.rec,chk.id,sid,nodes,now))continue;if(slot===null||rc.t<slot){slot=rc.t;cc=rc.body.cc||null;}}
   return {slot,cc};}
 /* Items [{rec, rcpt}] from a sub or a fetch. Gives true when every item was looked at. Calls run one after another,
@@ -394,16 +434,21 @@ async function fedCatalogLoad(){let txt=null;
   for(let i=0;i<L.length;i++){const e=L[i],r=rs[i];if(!r||r.id!==e.id)continue;
     out.push({...r.sum,listed:Number.isSafeInteger(e.listed)?e.listed:null,answered:Number.isSafeInteger(e.answered)?e.answered:null});}
   await fedPut('kv','registry',{asOf:j.asOf,at:now,servers:out});fedEmit('catalog',{source:'registry'});return true;}
-const fedSum=r=>({id:r.id,rid:r.srvId,t:r.srv.t,name:r.name,nodes:r.nodes,operators:r.ops,sync:r.sync,noLogs:r.noLogs,langs:r.srv.body.langs,desc:r.srv.body.desc});
+// Names and descriptions as the game shows them: no markup, no invisible characters (fedSafeName).
+const fedSum=r=>({id:r.id,rid:r.srvId,t:r.srv.t,name:fedSafeName(r.name),nodes:r.nodes,operators:r.ops,sync:r.sync,noLogs:r.noLogs,langs:r.srv.body.langs,desc:typeof r.srv.body.desc==='string'?fedSafeText(r.srv.body.desc):'',chain:r.chain.applied});
 // Gossip entries from a node ({genesis, chain, server, path, seen}): checked, then kept (a few per server).
 /* via: the server whose node sent the entries. A node gives clients an entry with the path it came by, which ends
    before that node's own server (§10.8 adds it only when passing on to servers): the game adds it, so the looking
    glass sees that the sending server syncs with the one before it on the path. */
 async function fedGossip(entries,via){if(!Array.isArray(entries))return;const now=fedNow(),g=(await fedGet('kv','gossip'))||[],L=entries.slice(0,256),rs=L.length?await fwDo('reg',{entries:L,now}):[];let ch=false;
+  // A server's chain only grows (§8.1): an entry whose chain forks from one already held (the registry's or gossip's) is
+  // signed by keys that were operators once, and is dropped.
+  const reg=(await fedGet('kv','registry'))||{servers:[]},held=id=>[...(reg.servers||[]).filter(x=>x.id===id),...g.filter(x=>x.id===id).map(x=>x.server)].map(x=>x.chain||[]);
   for(let i=0;i<L.length;i++){const e=L[i],r=rs[i];if(!r)continue;
     // Every hop must be a server identity (the vectors use short labels, so it is checked here); path and seen are
     // unsigned, so they stay advisory: shown, never trusted.
     if(!Array.isArray(e.path)||e.path.some(x=>FdId(x)))continue;
+    const c=r.sum.chain||[];if(held(r.id).some(h=>!fedPre(c,h)&&!fedPre(h,c)))continue;
     const x=fedGossipIn({id:r.id,path:e.path,seen:e.seen},null,now);if(x.action!=='store')continue;
     const path=typeof via==='string'&&!FdId(via)&&!e.path.includes(via)&&e.path.length<16?[...e.path,via]:e.path;
     g.push({id:r.id,server:r.sum,path,seen:e.seen,impl:fedImpls(e.impl,r.sum.nodes)});ch=true;}
@@ -422,11 +467,13 @@ async function fedServers(){const now=fedNow(),k=FEDDB.cat;
     if(gen===FEDDB.catGen){FEDDB.cat={gen,now,exp,list};await fedHidesTidy(list);}}
   return list.slice();}
 async function fedServersRead(now){const reg=(await fedGet('kv','registry'))||{servers:[]},gos=(await fedGet('kv','gossip'))||[];
-  const info=new Map();for(const g of gos)if(!info.has(g.id)||g.server.t>info.get(g.id).t)info.set(g.id,g.server);for(const r of reg.servers)info.set(r.id,r);
+  const info=new Map(),byRid=new Map();for(const r of reg.servers)info.set(r.id,r);for(const g of gos)byRid.set(g.id+' '+g.server.rid,g.server);
   // What its nodes run, from the freshest entry that said (informational, set by the server itself).
   const rel=new Map();for(const g of gos)if(g.impl&&typeof g.impl==='object'&&Object.keys(g.impl).length&&now<g.seen+FED_CARRY&&(!rel.has(g.id)||g.seen>rel.get(g.id).seen))rel.set(g.id,g);
-  return fedCatalogMerge(reg.servers.map(s=>({id:s.id,server:s})),gos,now).map(row=>{const i=info.get(row.id)||{};
-    return {...row,sync:i.sync,noLogs:i.noLogs,langs:i.langs||[],desc:i.desc||'',listed:i.listed??null,answered:i.answered??null,relays:rel.has(row.id)?rel.get(row.id).impl:{}};});}
+  // The descriptive fields from the server record the merge chose (the newest at the final head of the chain held).
+  return fedCatalogMerge(reg.servers.map(s=>({id:s.id,server:s})),gos,now).map(row=>{const i=info.get(row.id)||byRid.get(row.id+' '+row.rid)||{};
+    // Cleaned again on reading: entries cached before fedSum cleaned them.
+    return {...row,name:fedSafeName(row.name),sync:i.sync,noLogs:i.noLogs,langs:i.langs||[],desc:i.desc?fedSafeText(i.desc):'',listed:i.listed??null,answered:i.answered??null,relays:rel.has(row.id)?rel.get(row.id).impl:{}};});}
 /* Who may vote and hide, at the head of each server's chain as the catalog has it. fedVoters: the voting registry
    servers (§10.7) as Map id -> operator keys; fedOpOf: whether key operates server id. */
 async function fedVoters(){const reg=await fedGet('kv','registry'),m=new Map();if(!reg||!Array.isArray(reg.servers))return m;

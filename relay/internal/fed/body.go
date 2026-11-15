@@ -69,9 +69,12 @@ func intIn(lo, hi int64) check {
 func count(n int64) check { return intIn(0, n) }
 
 var (
-	mbps  = intIn(0, 1000000000)
-	money = intIn(0, 1000000000000)
-	days  = intIn(1, 3650)
+	mbps = intIn(0, 1000000000)
+	// traffic is what a network reports for the boards (spec 2.1 Traffic): up to 1 Ebps, so the boards can rank past
+	// 1 Pbps. Deals stay in mbps: their sizes get multiplied by money.
+	traffic = intIn(0, 1000000000000)
+	money   = intIn(0, 1000000000000)
+	days    = intIn(1, 3650)
 )
 
 func boolean(v any) string {
@@ -94,6 +97,16 @@ func oneOf(vals ...string) check {
 		}
 		return BadField
 	}
+}
+
+// boxCheck is a box key's format (3.1): 32 bytes. The weak-key rule is for Ed25519 keys only; a
+// low-order box fails when sealing (3.5).
+func boxCheck(v any) string {
+	s, _ := v.(string)
+	if _, ok := Decode(s, 32); !ok {
+		return BadKey
+	}
+	return ""
 }
 
 func keyCheck(v any) string {
@@ -530,7 +543,7 @@ func checkAnnounce(r *Record) string {
 			}
 			return ""
 		}),
-		req("box", keyCheck),
+		req("box", boxCheck),
 		req("home", cc),
 		req("day", count(10000000)),
 		req("founded", intIn(0, Div(r.T, Day))),
@@ -562,7 +575,7 @@ func checkAnnounce(r *Record) string {
 			}
 			return ""
 		}),
-		req("traffic", obj(req("in", mbps), req("out", mbps))),
+		req("traffic", obj(req("in", traffic), req("out", traffic))),
 		req("policy", oneOf("open", "selective", "restrictive")),
 		opt("cond", condCheck),
 		req("rates", rates),
@@ -618,7 +631,7 @@ func checkStats(r *Record) string {
 		}),
 		opt("pies", count(10000000)),
 		req("traffic", list(func(v any) string {
-			if code := object(v, []field{req("key", keyCheck), req("in", mbps), req("out", mbps)}); code != "" {
+			if code := object(v, []field{req("key", keyCheck), req("in", traffic), req("out", traffic)}); code != "" {
 				return code
 			}
 			if v.(map[string]any)["key"] == r.Key {
@@ -626,7 +639,7 @@ func checkStats(r *Record) string {
 			}
 			return ""
 		}, 0, 256, true)),
-		opt("total", mbps),
+		opt("total", traffic),
 		opt("cust", others(MaxCust)),
 		opt("up", others(MaxUp)),
 		req("tier1", boolean),
@@ -677,6 +690,21 @@ func bytesCheck(lo, hi int) check {
 
 // encCheck is the Box type of 5.3: {n, c}, which only the two parties of a deal can open. A relay
 // checks its shape, never what is inside.
+// BoxPad is the bucket sealed plaintexts are padded to (3.5).
+const BoxPad = 256
+
+// PadSealed pads a sealed plaintext (canonical JSON) with spaces to the next multiple of BoxPad,
+// at most BoxMax - 16 bytes, so a relay cannot tell deals apart by their length (3.5). Spaces after
+// JSON are whitespace: an opener that does not pad reads it the same.
+func PadSealed(b []byte) []byte {
+	n := (len(b) + BoxPad - 1) / BoxPad * BoxPad
+	n = min(n, BoxMax-16)
+	for len(b) < n {
+		b = append(b, ' ')
+	}
+	return b
+}
+
 var encCheck = obj(req("n", bytesCheck(BoxNonce, BoxNonce)), req("c", bytesCheck(BoxMin, BoxMax)))
 
 // notSelfKey: a Key that is not the author's own.
