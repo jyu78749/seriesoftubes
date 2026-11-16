@@ -43,6 +43,15 @@ test('Pioneer filters built-in Tier 1 traffic and scales broadband pay by reach'
   assert.deepEqual(errors, []);
 });
 
+test('Pioneer hides removed Tier 1s from the Networks tab', () => {
+  const { ev, errors } = load();
+  start(ev, ['pioneer']);
+  const id = ev("NETS.find(n=>n.type==='t1'&&!n.fed).id");
+  const name = ev(`NET['${id}'].name`);
+  assert.equal(ev(`(UI.netFocus='${id}',netsTab()).includes(${JSON.stringify(name)})`), false);
+  assert.deepEqual(errors, []);
+});
+
 test('Outcast blocks built-in IX ports but leaves own IXes and PNIs available', () => {
   const { ev, errors } = load();
   start(ev, ['outcast']);
